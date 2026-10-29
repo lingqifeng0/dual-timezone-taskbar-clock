@@ -1,0 +1,12 @@
+/build/
+/dist/
+/.zig-cache/
+/zig-cache/
+/config.json
+*.exe
+*.dll
+*.pdb
+*.lib
+*.obj
+*.ilk
+__pycache__/

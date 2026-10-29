@@ -1,0 +1,11 @@
+{
+  "local_label": "美国",
+  "china_label": "中国",
+  "top_is_china": false,
+  "time_format": "HH:mm",
+  "date_format": "yyyy/MM/dd",
+  "top_template": "%label% %time%",
+  "bottom_template": "%label% %time%",
+  "first_run": true,
+  "open_on_start": false
+}
