@@ -19,13 +19,32 @@ namespace NativeTaskbarClock
         internal static bool IsEnabled(string executable)
         {
             using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunKey, false)) {
-                return key != null && Matches(key.GetValue(ValueName) as string, executable);
+                string value = key == null ? null : key.GetValue(ValueName) as string;
+                return Matches(value, executable) || ClockExecutable(value) != null;
             }
         }
 
         private static bool Matches(string value, string executable)
         {
             return string.Equals(value, Command(executable), StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string ClockExecutable(string value)
+        {
+            if (string.IsNullOrEmpty(value) || value[0] != '"') return null;
+            int end = value.IndexOf('"', 1);
+            if (end < 0 || !string.Equals(value.Substring(end + 1).Trim(), "--background", StringComparison.OrdinalIgnoreCase)) return null;
+            string path = value.Substring(1, end - 1);
+            if (!Path.IsPathRooted(path)) return null;
+            string name = Path.GetFileName(path);
+            if (!name.StartsWith("TimeZoneClock", StringComparison.OrdinalIgnoreCase) || !name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)) return null;
+            return path;
+        }
+
+        internal static string RegisteredClockExecutable()
+        {
+            using (RegistryKey key = Registry.CurrentUser.OpenSubKey(RunKey, false))
+                return key == null ? null : ClockExecutable(key.GetValue(ValueName) as string);
         }
 
         internal static void SetEnabled(string executable, bool enabled)
@@ -42,10 +61,10 @@ namespace NativeTaskbarClock
             object raw = key.GetValue(ValueName, null, RegistryValueOptions.DoNotExpandEnvironmentNames);
             string existing = raw as string;
             if (enabled) {
-                if (raw != null && !Matches(existing, executable))
+                if (raw != null && !Matches(existing, executable) && ClockExecutable(existing) == null)
                     throw new InvalidOperationException("已有另一版本的同名开机启动项。请先关闭或移除旧项，再启用这个版本。");
                 key.SetValue(ValueName, Command(executable), RegistryValueKind.String);
-            } else if (existing != null && Matches(existing, executable)) {
+            } else if (existing != null && (Matches(existing, executable) || ClockExecutable(existing) != null)) {
                 key.DeleteValue(ValueName, false);
             }
         }

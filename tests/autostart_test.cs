@@ -19,6 +19,10 @@ internal static class AutostartTest
                 Check((string)key.GetValue(Autostart.ValueName) == "\"C:\\test folder\\TimeZoneClock.exe\" --background", "set command");
                 Autostart.SetForKey(key, executable, false);
                 Check(key.GetValue(Autostart.ValueName) == null, "remove own command");
+                key.SetValue(Autostart.ValueName, Autostart.Command(@"C:\old\TimeZoneClock-old.exe"), RegistryValueKind.String);
+                Autostart.SetForKey(key, executable, true);
+                Check((string)key.GetValue(Autostart.ValueName) == Autostart.Command(executable), "migrate known old clock startup entry on save");
+                Autostart.SetForKey(key, executable, false);
                 key.SetValue(Autostart.ValueName, "other application", RegistryValueKind.String);
                 bool refused = false;
                 try { Autostart.SetForKey(key, executable, true); }

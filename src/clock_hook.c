@@ -19,6 +19,7 @@
 #define STATUS_CONFLICT 5
 #define STATUS_PROTECT_FAILED 6
 #define STATUS_MONITOR_FAILED 7
+#define STATUS_INVALID_TIMEZONE 8
 
 typedef struct ClockOptions {
     DWORD size;
@@ -31,22 +32,32 @@ typedef struct ClockOptions {
     WCHAR date_format[64];
     WCHAR top_template[96];
     WCHAR bottom_template[96];
+    WCHAR local_zone_id[128];
+    WCHAR target_zone_id[128];
 #ifdef CLOCK_TEST
     uintptr_t test_module;
     uintptr_t test_time_return;
     uintptr_t test_date_return;
+    uintptr_t test_local_return;
 #endif
 } ClockOptions;
 
 typedef int (WINAPI *FormatTimeFn)(LPCWSTR,DWORD,const SYSTEMTIME*,LPCWSTR,LPWSTR,int);
 typedef int (WINAPI *FormatDateFn)(LPCWSTR,DWORD,const SYSTEMTIME*,LPCWSTR,LPWSTR,int,LPCWSTR);
+typedef VOID (WINAPI *LocalTimeFn)(LPSYSTEMTIME);
 
 static FormatTimeFn g_original_time;
 static FormatDateFn g_original_date;
+static LocalTimeFn g_original_local;
 static PVOID volatile *g_time_slot;
 static PVOID volatile *g_date_slot;
+static PVOID volatile *g_local_slot;
 static HMODULE g_tray;
 static ClockOptions g_options;
+static DYNAMIC_TIME_ZONE_INFORMATION g_target_zone;
+static DYNAMIC_TIME_ZONE_INFORMATION g_local_zone;
+static BOOL g_use_system_zone;
+static BOOL g_target_uses_system_zone;
 static volatile LONG g_active;
 static volatile LONG g_inflight;
 static unsigned long long g_generation;
@@ -64,6 +75,8 @@ static volatile LONG diag_last_time_rva, diag_last_date_rva;
  * the expected import slot before the hook can be enabled. */
 static const DWORD TIME_CALLS[] = {0xDA7F3,0xDABC7,0xDB043,0xDB05B,0x1322F7,0x13259F,0x1325B7};
 static const DWORD DATE_CALLS[] = {0xDEA77,0xDEC41,0xDEC83,0xDF1E2,0x13520E,0x1353CC,0x135409};
+/* GetLocalTime in the two verified ScheduleNextUpdate implementations. */
+static const DWORD SCHEDULE_CALLS[] = {0xDD0CB,0x1343BF};
 #endif
 
 static int copy_result(const WCHAR *text, LPWSTR output, int capacity) {
@@ -91,35 +104,55 @@ static BOOL is_clock_call(void *return_address, BOOL is_time) {
 #endif
 }
 
-static BOOL china_time(SYSTEMTIME *out) {
-    FILETIME ft;
-    ULARGE_INTEGER value;
-    GetSystemTimeAsFileTime(&ft);
-    value.LowPart = ft.dwLowDateTime;
-    value.HighPart = ft.dwHighDateTime;
-    value.QuadPart += 8ULL * 60 * 60 * 10000000ULL;
-    ft.dwLowDateTime = value.LowPart;
-    ft.dwHighDateTime = value.HighPart;
-    return FileTimeToSystemTime(&ft, out);
+static BOOL find_timezone(const WCHAR *id, DYNAMIC_TIME_ZONE_INFORMATION *result) {
+    DYNAMIC_TIME_ZONE_INFORMATION info;
+    for (DWORD i = 0; EnumDynamicTimeZoneInformation(i, &info) == ERROR_SUCCESS; ++i) {
+        if (_wcsicmp(info.TimeZoneKeyName, id) == 0) { *result = info; return TRUE; }
+    }
+    return FALSE;
 }
 
 static BOOL render_line(BOOL upper, WCHAR *line, size_t capacity) {
     BOOL use_china = upper ? g_options.top_is_china != 0 : g_options.top_is_china == 0;
     const WCHAR *label = use_china ? g_options.china_label : g_options.local_label;
     const WCHAR *format = upper ? g_options.top_template : g_options.bottom_template;
-    SYSTEMTIME value;
-    WCHAR clock[128], date[128];
-    if (use_china) { if (!china_time(&value)) return FALSE; }
-    else GetLocalTime(&value);
+    SYSTEMTIME utc, value;
+    DYNAMIC_TIME_ZONE_INFORMATION system_zone;
+    const DYNAMIC_TIME_ZONE_INFORMATION *zone = use_china ? &g_target_zone : &g_local_zone;
+    if ((use_china && g_target_uses_system_zone) || (!use_china && g_use_system_zone)) {
+        if (GetDynamicTimeZoneInformation(&system_zone) == TIME_ZONE_ID_INVALID) return FALSE;
+        zone = &system_zone;
+    }
+    GetSystemTime(&utc);
+    if (!SystemTimeToTzSpecificLocalTimeEx(zone, &utc, &value)) return FALSE;
+    WCHAR clock[128], date[128], weekday[128], offset[32], second[8];
     if (!g_original_time(NULL, 0, &value, g_options.time_format, clock, 128) ||
-        !g_original_date(NULL, 0, &value, g_options.date_format, date, 128, NULL)) return FALSE;
+        !g_original_date(NULL, 0, &value, g_options.date_format, date, 128, NULL) ||
+        !g_original_date(NULL, 0, &value, L"dddd", weekday, 128, NULL)) return FALSE;
+    FILETIME utc_file, local_file;
+    if (!SystemTimeToFileTime(&utc, &utc_file) || !SystemTimeToFileTime(&value, &local_file)) return FALSE;
+    ULARGE_INTEGER utc_ticks, local_ticks;
+    utc_ticks.LowPart = utc_file.dwLowDateTime; utc_ticks.HighPart = utc_file.dwHighDateTime;
+    local_ticks.LowPart = local_file.dwLowDateTime; local_ticks.HighPart = local_file.dwHighDateTime;
+    LONGLONG delta = (LONGLONG)local_ticks.QuadPart - (LONGLONG)utc_ticks.QuadPart;
+    int minutes = (int)(delta / 600000000LL), abs_minutes = minutes < 0 ? -minutes : minutes;
+    if (FAILED(StringCchPrintfW(offset, 32, L"UTC%c%02d:%02d", minutes < 0 ? L'-' : L'+', abs_minutes / 60, abs_minutes % 60))) return FALSE;
     size_t used = 0;
+    BOOL previous_was_time = FALSE;
     while (*format) {
         const WCHAR *replacement = NULL;
         size_t advance = 1;
+        BOOL this_is_time = FALSE;
         if (!wcsncmp(format, L"%label%", 7)) { replacement = label; advance = 7; }
-        else if (!wcsncmp(format, L"%time%", 6)) { replacement = clock; advance = 6; }
+        else if (!wcsncmp(format, L"%time%", 6)) { replacement = clock; advance = 6; this_is_time = TRUE; }
         else if (!wcsncmp(format, L"%date%", 6)) { replacement = date; advance = 6; }
+        else if (!wcsncmp(format, L"%weekday%", 9)) { replacement = weekday; advance = 9; }
+        else if (!wcsncmp(format, L"%offset%", 8)) { replacement = offset; advance = 8; }
+        else if (!wcsncmp(format, L"%second%", 8)) {
+            if (FAILED(StringCchPrintfW(second, 8, L"%s%02u", previous_was_time ? L":" : L"",
+                (unsigned)value.wSecond))) return FALSE;
+            replacement = second; advance = 8;
+        }
         else if (!wcsncmp(format, L"%%", 2)) { replacement = L"%"; advance = 2; }
         if (replacement) {
             size_t count = wcslen(replacement);
@@ -130,10 +163,31 @@ static BOOL render_line(BOOL upper, WCHAR *line, size_t capacity) {
             if (used + 1 >= capacity) return FALSE;
             line[used++] = *format;
         }
+        previous_was_time = this_is_time;
         format += advance;
     }
     line[used] = 0;
     return TRUE;
+}
+
+/* The original scheduler uses 60 - wSecond when Windows' own seconds option
+ * is off. Restrict the changed value to its two verified call sites, giving a
+ * one-second interval without changing the Windows setting or writing the
+ * registry repeatedly. All other callers receive the actual local time. */
+static VOID WINAPI hooked_local(LPSYSTEMTIME time) {
+    void *caller = __builtin_return_address(0);
+    InterlockedIncrement(&g_inflight);
+    g_original_local(time);
+    if (time && InterlockedCompareExchange(&g_active, 0, 0) && g_options.reserved == 1) {
+#ifdef CLOCK_TEST
+        if ((uintptr_t)caller == g_options.test_local_return) time->wSecond = 59;
+#else
+        uintptr_t address = (uintptr_t)caller, base = (uintptr_t)g_tray;
+        for (size_t i = 0; i < sizeof(SCHEDULE_CALLS)/sizeof(SCHEDULE_CALLS[0]); ++i)
+            if (address == base + SCHEDULE_CALLS[i] + 6) { time->wSecond = 59; break; }
+#endif
+    }
+    InterlockedDecrement(&g_inflight);
 }
 
 static int WINAPI hooked_time(LPCWSTR locale, DWORD flags, const SYSTEMTIME *time,
@@ -205,6 +259,8 @@ static BOOL find_imports(HMODULE module) {
                 g_time_slot = (PVOID volatile *)&slots->u1.Function;
             if (strcmp((char *)by_name->Name, "GetDateFormatEx") == 0)
                 g_date_slot = (PVOID volatile *)&slots->u1.Function;
+            if (strcmp((char *)by_name->Name, "GetLocalTime") == 0)
+                g_local_slot = (PVOID volatile *)&slots->u1.Function;
         }
     }
     return g_time_slot && g_date_slot;
@@ -238,7 +294,8 @@ static BOOL stop_internal(unsigned long long generation) {
     if ((!generation || generation == g_generation) && InterlockedExchange(&g_active, 0)) {
         BOOL time_ok = replace_slot(g_time_slot, (PVOID)hooked_time, (PVOID)g_original_time);
         BOOL date_ok = replace_slot(g_date_slot, (PVOID)hooked_date, (PVOID)g_original_date);
-        restored = time_ok && date_ok;
+        BOOL local_ok = !g_options.reserved || replace_slot(g_local_slot, (PVOID)hooked_local, (PVOID)g_original_local);
+        restored = time_ok && date_ok && local_ok;
         if (g_stop_event) SetEvent(g_stop_event);
     }
     ReleaseSRWLockExclusive(&g_lock);
@@ -266,8 +323,13 @@ __declspec(dllexport) DWORD WINAPI InstallClockHook(void *parameter) {
         !wmemchr(options->local_label, 0, 32) || !wmemchr(options->china_label, 0, 32) ||
         !wmemchr(options->time_format, 0, 64) || !wmemchr(options->date_format, 0, 64) ||
         !wmemchr(options->top_template, 0, 96) || !wmemchr(options->bottom_template, 0, 96) ||
-        !options->time_format[0] || !options->date_format[0] || options->top_is_china > 1)
+        !wmemchr(options->local_zone_id, 0, 128) || !wmemchr(options->target_zone_id, 0, 128) ||
+        !options->time_format[0] || !options->date_format[0] || options->top_is_china > 1 || options->reserved > 1)
         return STATUS_BAD_ARGUMENT;
+    DYNAMIC_TIME_ZONE_INFORMATION target_zone = {0};
+    if (options->target_zone_id[0] && !find_timezone(options->target_zone_id, &target_zone)) return STATUS_INVALID_TIMEZONE;
+    DYNAMIC_TIME_ZONE_INFORMATION local_zone = {0};
+    if (options->local_zone_id[0] && !find_timezone(options->local_zone_id, &local_zone)) return STATUS_INVALID_TIMEZONE;
     AcquireSRWLockExclusive(&g_lock);
     if (g_active) { ReleaseSRWLockExclusive(&g_lock); return STATUS_ALREADY_ACTIVE; }
 #ifdef CLOCK_TEST
@@ -278,18 +340,25 @@ __declspec(dllexport) DWORD WINAPI InstallClockHook(void *parameter) {
     if (!g_tray) { ReleaseSRWLockExclusive(&g_lock); return STATUS_UNSUPPORTED_MODULE; }
     g_time_slot = NULL;
     g_date_slot = NULL;
+    g_local_slot = NULL;
     if (!find_imports(g_tray)) { ReleaseSRWLockExclusive(&g_lock); return STATUS_IMPORT_MISSING; }
+    if (options->reserved && !g_local_slot) { ReleaseSRWLockExclusive(&g_lock); return STATUS_IMPORT_MISSING; }
 #ifndef CLOCK_TEST
     if (!validate_calls(TIME_CALLS, sizeof(TIME_CALLS)/sizeof(TIME_CALLS[0]), g_time_slot) ||
         !validate_calls(DATE_CALLS, sizeof(DATE_CALLS)/sizeof(DATE_CALLS[0]), g_date_slot)) {
+        ReleaseSRWLockExclusive(&g_lock); return STATUS_UNSUPPORTED_MODULE;
+    }
+    if (options->reserved && !validate_calls(SCHEDULE_CALLS, sizeof(SCHEDULE_CALLS)/sizeof(SCHEDULE_CALLS[0]), g_local_slot)) {
         ReleaseSRWLockExclusive(&g_lock); return STATUS_UNSUPPORTED_MODULE;
     }
 #endif
     HMODULE kernel = GetModuleHandleW(L"kernel32.dll");
     g_original_time = (FormatTimeFn)GetProcAddress(kernel, "GetTimeFormatEx");
     g_original_date = (FormatDateFn)GetProcAddress(kernel, "GetDateFormatEx");
+    g_original_local = (LocalTimeFn)GetProcAddress(kernel, "GetLocalTime");
     if (!g_original_time || !g_original_date || *g_time_slot != (PVOID)g_original_time ||
-        *g_date_slot != (PVOID)g_original_date) {
+        *g_date_slot != (PVOID)g_original_date ||
+        (options->reserved && (!g_original_local || *g_local_slot != (PVOID)g_original_local))) {
         ReleaseSRWLockExclusive(&g_lock); return STATUS_CONFLICT;
     }
     HANDLE controller = OpenProcess(SYNCHRONIZE, FALSE, options->controller_pid);
@@ -310,6 +379,10 @@ __declspec(dllexport) DWORD WINAPI InstallClockHook(void *parameter) {
     monitor_data->generation = ++g_generation;
     g_stop_event = monitor_data->stop_event;
     g_options = *options;
+    g_target_zone = target_zone;
+    g_local_zone = local_zone;
+    g_use_system_zone = !options->local_zone_id[0];
+    g_target_uses_system_zone = !options->target_zone_id[0];
     InterlockedExchange(&g_active, 1);
     if (!replace_slot(g_time_slot, (PVOID)g_original_time, (PVOID)hooked_time)) {
         InterlockedExchange(&g_active, 0); g_stop_event = NULL; CloseHandle(controller);
@@ -322,11 +395,19 @@ __declspec(dllexport) DWORD WINAPI InstallClockHook(void *parameter) {
         g_stop_event = NULL; CloseHandle(controller); CloseHandle(monitor_data->stop_event); HeapFree(GetProcessHeap(), 0, monitor_data);
         ReleaseSRWLockExclusive(&g_lock); return STATUS_PROTECT_FAILED;
     }
+    if (options->reserved && !replace_slot(g_local_slot, (PVOID)g_original_local, (PVOID)hooked_local)) {
+        InterlockedExchange(&g_active, 0);
+        replace_slot(g_time_slot, (PVOID)hooked_time, (PVOID)g_original_time);
+        replace_slot(g_date_slot, (PVOID)hooked_date, (PVOID)g_original_date);
+        g_stop_event = NULL; CloseHandle(controller); CloseHandle(monitor_data->stop_event); HeapFree(GetProcessHeap(), 0, monitor_data);
+        ReleaseSRWLockExclusive(&g_lock); return STATUS_PROTECT_FAILED;
+    }
     HANDLE monitor = CreateThread(NULL, 0, monitor_controller, monitor_data, 0, NULL);
     if (!monitor) {
         InterlockedExchange(&g_active, 0);
         replace_slot(g_time_slot, (PVOID)hooked_time, (PVOID)g_original_time);
         replace_slot(g_date_slot, (PVOID)hooked_date, (PVOID)g_original_date);
+        if (options->reserved) replace_slot(g_local_slot, (PVOID)hooked_local, (PVOID)g_original_local);
         g_stop_event = NULL; CloseHandle(controller); CloseHandle(monitor_data->stop_event); HeapFree(GetProcessHeap(), 0, monitor_data);
         ReleaseSRWLockExclusive(&g_lock); return STATUS_MONITOR_FAILED;
     }
@@ -339,6 +420,20 @@ __declspec(dllexport) DWORD WINAPI UninstallClockHook(void *unused) {
     (void)unused;
     return stop_internal(0) ? STATUS_OK : STATUS_PROTECT_FAILED;
 }
+
+#ifdef CLOCK_TEST
+typedef struct TestTimezoneArgs {
+    WCHAR zone_id[128];
+    SYSTEMTIME utc;
+    SYSTEMTIME local;
+} TestTimezoneArgs;
+__declspec(dllexport) DWORD WINAPI TestTimezoneConversion(void *parameter) {
+    TestTimezoneArgs *args = (TestTimezoneArgs *)parameter;
+    DYNAMIC_TIME_ZONE_INFORMATION zone;
+    if (!args || !wmemchr(args->zone_id, 0, 128) || !find_timezone(args->zone_id, &zone)) return 1;
+    return SystemTimeToTzSpecificLocalTimeEx(&zone, &args->utc, &args->local) ? 0 : 2;
+}
+#endif
 
 #ifdef CLOCK_DIAGNOSTICS
 __declspec(dllexport) DWORD WINAPI HookDiagnosticCounts(void *unused) {

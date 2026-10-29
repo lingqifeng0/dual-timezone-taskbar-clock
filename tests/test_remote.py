@@ -22,8 +22,9 @@ class ClockOptions(ctypes.Structure):
                 ("local_label", wintypes.WCHAR * 32), ("china_label", wintypes.WCHAR * 32),
                 ("time_format", wintypes.WCHAR * 64), ("date_format", wintypes.WCHAR * 64),
                 ("top_template", wintypes.WCHAR * 96), ("bottom_template", wintypes.WCHAR * 96),
+                ("local_zone_id", wintypes.WCHAR * 128), ("target_zone_id", wintypes.WCHAR * 128),
                 ("test_module", ctypes.c_size_t), ("test_time_return", ctypes.c_size_t),
-                ("test_date_return", ctypes.c_size_t)]
+                ("test_date_return", ctypes.c_size_t), ("test_local_return", ctypes.c_size_t)]
 
 k.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 k.OpenProcess.restype = wintypes.HANDLE
@@ -94,7 +95,7 @@ process = None
 try:
     ready = fixture.stdout.readline().strip().split()
     assert ready[0] == "READY", ready
-    pid, base, t_return, d_return = map(int, ready[1:])
+    pid, base, t_return, d_return, l_return = map(int, ready[1:])
     process = k.OpenProcess(0x0002 | 0x0400 | 0x0008 | 0x0020 | 0x0010, False, pid)
     if not process: raise ctypes.WinError(ctypes.get_last_error())
     local_base = k.GetModuleHandleW("KernelBase.dll")
@@ -112,19 +113,19 @@ try:
 
     guardian = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"],
                                 creationflags=subprocess.CREATE_NO_WINDOW)
-    options = ClockOptions(ctypes.sizeof(ClockOptions), guardian.pid, 0, 0, "USA", "CHINA",
-                           "HH:mm", "yyyy/MM/dd", "%label% %time%", "%label% %time%",
-                           base, t_return, d_return)
+    options = ClockOptions(ctypes.sizeof(ClockOptions), guardian.pid, 0, 1, "USA", "CHINA",
+                           "HH:mm", "yyyy/MM/dd", "%label% %time%", "%label% %time%", "", "China Standard Time",
+                           base, t_return, d_return, l_return)
     assert invoke(process, install, bytes(options)) == 0
-    wait_frame(fixture, "FRAME 1 1 0")
+    wait_frame(fixture, "FRAME 1 1 0 1")
     guardian.terminate(); guardian.wait(timeout=5); guardian = None
-    wait_frame(fixture, "FRAME 0 0 0")
+    wait_frame(fixture, "FRAME 0 0 0 0")
 
     options.controller_pid = k.GetCurrentProcessId()
     assert invoke(process, install, bytes(options)) == 0
-    wait_frame(fixture, "FRAME 1 1 0")
+    wait_frame(fixture, "FRAME 1 1 0 1")
     assert invoke(process, uninstall) == 0
-    wait_frame(fixture, "FRAME 0 0 0")
+    wait_frame(fixture, "FRAME 0 0 0 0")
     print("PASS: remote injection into fixture, controller-death cleanup, reapply and restoration")
 finally:
     if guardian:

@@ -16,7 +16,7 @@ namespace NativeTaskbarClock
     {
         private static string Name
         {
-            get { return "DualZoneClockV2_" + WindowsIdentity.GetCurrent().User.Value + "_" + Process.GetCurrentProcess().SessionId; }
+            get { return "DualZoneClockV9_" + WindowsIdentity.GetCurrent().User.Value + "_" + Process.GetCurrentProcess().SessionId; }
         }
 
         public static void Apply(ClockSettings settings)

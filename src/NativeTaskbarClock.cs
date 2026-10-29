@@ -48,6 +48,8 @@ namespace NativeTaskbarClock
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst=64)] public string DateFormat;
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst=96)] public string TopTemplate;
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst=96)] public string BottomTemplate;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst=128)] public string LocalZoneId;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst=128)] public string TargetZoneId;
     }
 
     internal sealed class Controller : ApplicationContext
@@ -80,8 +82,8 @@ namespace NativeTaskbarClock
             menu.MenuItems.Add("说明", delegate { ShowHelp(); });
             menu.MenuItems.Add("退出并恢复原时钟", delegate { ExitThread(); });
             tray = new NotifyIcon();
-            tray.Icon = SystemIcons.Information;
-            tray.Text = "美中双时区时钟";
+            tray.Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath) ?? SystemIcons.Application;
+            tray.Text = "双时区时钟";
             tray.ContextMenu = menu;
             tray.DoubleClick += delegate { ShowSettings(); };
             tray.Visible = true;
@@ -133,9 +135,10 @@ namespace NativeTaskbarClock
             return null;
         }
 
-        private string HookName { get { return diagnostic ? "ClockProbeV2.dll" : "ClockNativeV2.dll"; } }
-        private string HookPath { get { return Path.Combine(directory, HookName); } }
-        private string ConfigPath { get { return Path.Combine(directory, "config.json"); } }
+        private string HookName { get { return ClockStorage.ModuleName; } }
+        private string cachedHookPath;
+        private string HookPath { get { if (cachedHookPath == null) cachedHookPath = ClockStorage.ExtractModule(); return cachedHookPath; } }
+        private string ConfigPath { get { return ClockStorage.ConfigPath; } }
 
         private static ClockOptions BuildOptions(ClockSettings settings)
         {
@@ -146,10 +149,13 @@ namespace NativeTaskbarClock
             options.LocalLabel = settings.LocalLabel;
             options.ChinaLabel = settings.ChinaLabel;
             options.TopIsChina = settings.TopIsChina ? 1u : 0u;
+            options.Reserved = settings.RequiresSecondRefresh() ? 1u : 0u;
             options.TimeFormat = settings.TimeFormat;
             options.DateFormat = settings.DateFormat;
-            options.TopTemplate = settings.TopTemplate;
-            options.BottomTemplate = settings.BottomTemplate;
+            options.TopTemplate = TemplateParts.ForLabel(settings.TopTemplate, settings.TopIsChina ? settings.ChinaLabel : settings.LocalLabel);
+            options.BottomTemplate = TemplateParts.ForLabel(settings.BottomTemplate, settings.TopIsChina ? settings.LocalLabel : settings.ChinaLabel);
+            options.LocalZoneId = settings.LocalZoneId;
+            options.TargetZoneId = settings.TargetZoneId;
             return options;
         }
 
@@ -207,7 +213,9 @@ namespace NativeTaskbarClock
         private IntPtr HookExportInRemote(uint pid, string exportName)
         {
             ProcessModule remote = FindModule(pid, HookName);
-            if (remote == null || !IsSameHook(remote.FileName))
+            if (remote == null)
+                throw new InvalidOperationException("无法将内置时钟模块加载到任务栏。请退出程序后重新打开；若仍有问题，请查看程序缓存位置。 ");
+            if (!IsSameHook(remote.FileName))
                 throw new InvalidOperationException("任务栏中已有不同版本的时钟模块。请退出时钟并重启 Windows 资源管理器后重试。");
             IntPtr local = Native.LoadLibraryW(HookPath);
             if (local == IntPtr.Zero) throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error());
@@ -307,7 +315,7 @@ namespace NativeTaskbarClock
                 return;
             }
             if (diagnostic) File.WriteAllText(Path.Combine(directory, "diagnostic-result.txt"), "enabled", Encoding.UTF8);
-            else tray.ShowBalloonTip(4000, "美中双时区时钟已启用", "任务栏可能在下一分钟刷新。右键本图标可设置或退出。", ToolTipIcon.Info);
+            else tray.ShowBalloonTip(4000, "双时区时钟已启用", "任务栏可能在下一分钟刷新。右键本图标可设置或退出。", ToolTipIcon.Info);
         }
 
         private void ShowSettings()
@@ -441,14 +449,14 @@ namespace NativeTaskbarClock
     internal static class Program
     {
         private const string StopEventName = @"Local\DualZoneNativeTaskbarClock.Stop";
-        private const string ShowEventName = @"Local\DualZoneNativeTaskbarClock.ShowV2";
+        private const string ShowEventName = @"Local\DualZoneNativeTaskbarClock.ShowV9";
         [STAThread] private static void Main(string[] args)
         {
             if (args.Contains("--panel")) {
                 try {
                     Application.EnableVisualStyles();
                     Application.SetCompatibleTextRenderingDefault(false);
-                    string configPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "config.json");
+                    string configPath = ClockStorage.ConfigPath;
                     ClockSettings settings = ClockSettings.Load(configPath);
                     settings.StartOnLogin = Autostart.IsEnabled(Application.ExecutablePath);
                     Application.Run(new SettingsForm(settings, SettingsPipe.Apply));
@@ -464,11 +472,13 @@ namespace NativeTaskbarClock
             using (var mutex = new System.Threading.Mutex(true, @"Local\DualZoneNativeTaskbarClock", out created)) {
                 if (!created) {
                     try { using (var signal = System.Threading.EventWaitHandle.OpenExisting(ShowEventName)) signal.Set(); }
-                    catch (System.Threading.WaitHandleCannotBeOpenedException) { MessageBox.Show("旧版时钟正在运行，请先从通知区域退出旧版。", "美中双时区时钟"); }
+                    catch (System.Threading.WaitHandleCannotBeOpenedException) { MessageBox.Show("旧版时钟正在运行。请先在通知区域右键旧图标，选择“退出并恢复原时钟”，再启动新版。", "双时区时钟"); }
                     return;
                 }
                 using (var stopSignal = new System.Threading.EventWaitHandle(false, System.Threading.EventResetMode.AutoReset, StopEventName)) {
                     using (var showSignal = new System.Threading.EventWaitHandle(false, System.Threading.EventResetMode.AutoReset, ShowEventName)) {
+                        try { ClockStorage.Initialize(); }
+                        catch (Exception ex) { MessageBox.Show(ex.Message, "双时区时钟", MessageBoxButtons.OK, MessageBoxIcon.Warning); return; }
                         Application.EnableVisualStyles();
                         Application.SetCompatibleTextRenderingDefault(false);
                         Application.Run(new Controller(args.Contains("--diagnostic"), args.Contains("--settings"), args.Contains("--background"), stopSignal, showSignal));

@@ -9,8 +9,12 @@ namespace NativeTaskbarClock
 {
     internal sealed class ClockSettings
     {
-        public string LocalLabel = "美国";
+        public string LocalLabel = "本地";
+        // Empty means follow Windows' current system time zone.
+        public string LocalZoneId = "";
         public string ChinaLabel = "中国";
+        // The historic field name ChinaLabel represents the chosen second zone.
+        public string TargetZoneId = "China Standard Time";
         public bool TopIsChina = false;
         public string TimeFormat = "HH:mm";
         public string DateFormat = "yyyy/MM/dd";
@@ -21,6 +25,8 @@ namespace NativeTaskbarClock
         // This reflects the Windows per-user startup entry, not config.json.
         public bool StartOnLogin = false;
 
+        internal ClockSettings Copy() { return (ClockSettings)MemberwiseClone(); }
+
         public static ClockSettings Load(string path)
         {
             ClockSettings settings = new ClockSettings();
@@ -29,7 +35,9 @@ namespace NativeTaskbarClock
             if (values == null) throw new InvalidDataException("配置文件必须包含 JSON 对象。");
             object v;
             if (values.TryGetValue("local_label", out v)) settings.LocalLabel = Convert.ToString(v);
+            if (values.TryGetValue("local_zone_id", out v)) settings.LocalZoneId = Convert.ToString(v);
             if (values.TryGetValue("china_label", out v)) settings.ChinaLabel = Convert.ToString(v);
+            if (values.TryGetValue("target_zone_id", out v)) settings.TargetZoneId = Convert.ToString(v);
             if (values.TryGetValue("top_is_china", out v)) settings.TopIsChina = Convert.ToBoolean(v);
             if (values.TryGetValue("time_format", out v)) settings.TimeFormat = Convert.ToString(v);
             if (values.TryGetValue("date_format", out v)) settings.DateFormat = Convert.ToString(v);
@@ -46,7 +54,9 @@ namespace NativeTaskbarClock
             JavaScriptSerializer json = new JavaScriptSerializer();
             string body = "{\r\n" +
                 "  \"local_label\": " + json.Serialize(LocalLabel) + ",\r\n" +
+                "  \"local_zone_id\": " + json.Serialize(LocalZoneId) + ",\r\n" +
                 "  \"china_label\": " + json.Serialize(ChinaLabel) + ",\r\n" +
+                "  \"target_zone_id\": " + json.Serialize(TargetZoneId) + ",\r\n" +
                 "  \"top_is_china\": " + json.Serialize(TopIsChina) + ",\r\n" +
                 "  \"time_format\": " + json.Serialize(TimeFormat) + ",\r\n" +
                 "  \"date_format\": " + json.Serialize(DateFormat) + ",\r\n" +
@@ -66,14 +76,20 @@ namespace NativeTaskbarClock
 
         public void Validate()
         {
-            ValidateField(LocalLabel, "美国时间标签", 31, true);
-            ValidateField(ChinaLabel, "中国时间标签", 31, true);
+            ValidateField(LocalLabel, "第一时区标签", 31, true);
+            ValidateField(ChinaLabel, "第二时区标签", 31, true);
+            ValidateField(LocalZoneId, "第一时区", 127, true);
+            ValidateField(TargetZoneId, "第二时区", 127, true);
+            try {
+                if (!string.IsNullOrEmpty(LocalZoneId)) TimeZoneInfo.FindSystemTimeZoneById(LocalZoneId);
+                if (!string.IsNullOrEmpty(TargetZoneId)) TimeZoneInfo.FindSystemTimeZoneById(TargetZoneId);
+            }
+            catch (TimeZoneNotFoundException) { throw new InvalidDataException("系统中找不到所选时区，请重新选择。"); }
+            catch (InvalidTimeZoneException) { throw new InvalidDataException("所选时区数据无效，请重新选择。"); }
             ValidateField(TimeFormat, "时间格式", 63, false);
             ValidateField(DateFormat, "日期格式", 63, false);
             ValidateField(TopTemplate, "上行内容", 95, true);
             ValidateField(BottomTemplate, "下行内容", 95, true);
-            if (ContainsSeconds(TimeFormat))
-                throw new InvalidDataException("原生任务栏按分钟刷新，目前不支持显示秒。请从时间格式中移除 s 或 ss。");
             ValidateTemplate(TopTemplate, "上行内容");
             ValidateTemplate(BottomTemplate, "下行内容");
             ClockFormatter.Preview(this, DateTime.UtcNow); // reject formats Windows cannot render
@@ -98,6 +114,32 @@ namespace NativeTaskbarClock
             return false;
         }
 
+        // A literal %%second%% is text, not a module. Only request a faster
+        // taskbar timer when a displayed module actually needs seconds.
+        private static bool HasToken(string template, string token)
+        {
+            string[] tokens = { "%label%", "%time%", "%second%", "%date%", "%weekday%", "%offset%" };
+            for (int i = 0; i < template.Length;) {
+                if (template[i] != '%') { ++i; continue; }
+                if (i + 1 < template.Length && template[i + 1] == '%') { i += 2; continue; }
+                bool matched = false;
+                foreach (string candidate in tokens) {
+                    if (template.Length - i >= candidate.Length && string.CompareOrdinal(template, i, candidate, 0, candidate.Length) == 0) {
+                        if (candidate == token) return true;
+                        i += candidate.Length; matched = true; break;
+                    }
+                }
+                if (!matched) ++i;
+            }
+            return false;
+        }
+
+        internal bool RequiresSecondRefresh()
+        {
+            return HasToken(TopTemplate, "%second%") || HasToken(BottomTemplate, "%second%") ||
+                (ContainsSeconds(TimeFormat) && (HasToken(TopTemplate, "%time%") || HasToken(BottomTemplate, "%time%")));
+        }
+
         private static void ValidateTemplate(string text, string name)
         {
             for (int i = 0; i < text.Length; ++i) {
@@ -106,7 +148,10 @@ namespace NativeTaskbarClock
                 if (tail.StartsWith("%%", StringComparison.Ordinal)) { ++i; continue; }
                 if (tail.StartsWith("%label%", StringComparison.Ordinal)) { i += 6; continue; }
                 if (tail.StartsWith("%time%", StringComparison.Ordinal) || tail.StartsWith("%date%", StringComparison.Ordinal)) { i += 5; continue; }
-                throw new InvalidDataException(name + "包含未知的 % 变量。请使用 %label%、%time%、%date%，或用 %% 显示百分号。");
+                if (tail.StartsWith("%weekday%", StringComparison.Ordinal)) { i += 8; continue; }
+                if (tail.StartsWith("%offset%", StringComparison.Ordinal)) { i += 7; continue; }
+                if (tail.StartsWith("%second%", StringComparison.Ordinal)) { i += 7; continue; }
+                throw new InvalidDataException(name + "包含未知的 % 变量。可使用标签、时间、秒、日期、星期、时区偏移模块，或用 %% 显示百分号。");
             }
         }
     }
@@ -129,29 +174,45 @@ namespace NativeTaskbarClock
 
         public static string[] Preview(ClockSettings settings, DateTime utc)
         {
-            DateTime local = utc.ToLocalTime();
-            DateTime china = utc.AddHours(8);
+            TimeZoneInfo localZone = string.IsNullOrEmpty(settings.LocalZoneId) ? TimeZoneInfo.Local : TimeZoneInfo.FindSystemTimeZoneById(settings.LocalZoneId);
+            TimeZoneInfo targetZone = string.IsNullOrEmpty(settings.TargetZoneId) ? TimeZoneInfo.Local : TimeZoneInfo.FindSystemTimeZoneById(settings.TargetZoneId);
+            DateTime local = TimeZoneInfo.ConvertTimeFromUtc(utc, localZone);
+            DateTime china = TimeZoneInfo.ConvertTimeFromUtc(utc, targetZone);
+            TimeSpan localOffset = localZone.GetUtcOffset(utc), targetOffset = targetZone.GetUtcOffset(utc);
             return new string[] {
-                Render(settings, settings.TopIsChina ? china : local, settings.TopIsChina ? settings.ChinaLabel : settings.LocalLabel, settings.TopTemplate),
-                Render(settings, settings.TopIsChina ? local : china, settings.TopIsChina ? settings.LocalLabel : settings.ChinaLabel, settings.BottomTemplate)
+                Render(settings, settings.TopIsChina ? china : local, settings.TopIsChina ? settings.ChinaLabel : settings.LocalLabel, settings.TopTemplate, settings.TopIsChina ? targetOffset : localOffset),
+                Render(settings, settings.TopIsChina ? local : china, settings.TopIsChina ? settings.LocalLabel : settings.ChinaLabel, settings.BottomTemplate, settings.TopIsChina ? localOffset : targetOffset)
             };
         }
 
-        private static string Render(ClockSettings s, DateTime value, string label, string template)
+        private static string Render(ClockSettings s, DateTime value, string label, string template, TimeSpan offset)
         {
+            template = TemplateParts.ForLabel(template, label);
             SystemTime time = SystemTime.FromDateTime(value);
-            StringBuilder t = new StringBuilder(128), d = new StringBuilder(128);
+            StringBuilder t = new StringBuilder(128), d = new StringBuilder(128), weekday = new StringBuilder(128);
             if (GetTimeFormatEx(null, 0, ref time, s.TimeFormat, t, t.Capacity) == 0 ||
-                GetDateFormatEx(null, 0, ref time, s.DateFormat, d, d.Capacity, null) == 0)
+                GetDateFormatEx(null, 0, ref time, s.DateFormat, d, d.Capacity, null) == 0 ||
+                GetDateFormatEx(null, 0, ref time, "dddd", weekday, weekday.Capacity, null) == 0)
                 throw new InvalidDataException("Windows 无法显示该时间或日期格式，请调整后再试。");
+            int offsetMinutes = (int)offset.TotalMinutes;
+            int absoluteMinutes = Math.Abs(offsetMinutes);
+            string offsetText = string.Format(System.Globalization.CultureInfo.InvariantCulture, "UTC{0}{1:00}:{2:00}", offsetMinutes < 0 ? "-" : "+", absoluteMinutes / 60, absoluteMinutes % 60);
             StringBuilder result = new StringBuilder();
+            bool previousWasTime = false;
             for (int i = 0; i < template.Length;) {
                 string rest = template.Substring(i);
                 if (rest.StartsWith("%label%", StringComparison.Ordinal)) { result.Append(label); i += 7; }
-                else if (rest.StartsWith("%time%", StringComparison.Ordinal)) { result.Append(t); i += 6; }
+                else if (rest.StartsWith("%time%", StringComparison.Ordinal)) { result.Append(t); i += 6; previousWasTime = true; continue; }
                 else if (rest.StartsWith("%date%", StringComparison.Ordinal)) { result.Append(d); i += 6; }
+                else if (rest.StartsWith("%weekday%", StringComparison.Ordinal)) { result.Append(weekday); i += 9; }
+                else if (rest.StartsWith("%offset%", StringComparison.Ordinal)) { result.Append(offsetText); i += 8; }
+                else if (rest.StartsWith("%second%", StringComparison.Ordinal)) {
+                    if (previousWasTime) result.Append(':');
+                    result.Append(value.Second.ToString("00", System.Globalization.CultureInfo.InvariantCulture)); i += 8;
+                }
                 else if (rest.StartsWith("%%", StringComparison.Ordinal)) { result.Append('%'); i += 2; }
                 else { result.Append(template[i]); ++i; }
+                previousWasTime = false;
             }
             if (result.Length >= 512) throw new InvalidDataException("内容过长，请缩短行格式。");
             return result.ToString();

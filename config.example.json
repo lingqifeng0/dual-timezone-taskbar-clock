@@ -1,6 +1,8 @@
 {
-  "local_label": "美国",
+  "local_label": "本地",
+  "local_zone_id": "",
   "china_label": "中国",
+  "target_zone_id": "China Standard Time",
   "top_is_china": false,
   "time_format": "HH:mm",
   "date_format": "yyyy/MM/dd",
