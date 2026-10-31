@@ -1,7 +1,11 @@
 param(
     [string]$ZigPath = 'zig',
     [string]$PythonPath = 'py',
-    [switch]$Test
+    [switch]$Test,
+    [string]$SignToolPath = '',
+    [string]$SigningCertificateThumbprint = '',
+    [string]$TimestampUrl = 'http://timestamp.digicert.com',
+    [switch]$RequireSignature
 )
 
 $ErrorActionPreference = 'Stop'
@@ -10,6 +14,26 @@ Set-StrictMode -Version Latest
 function Invoke-Checked([string]$Program, [string[]]$Arguments) {
     & $Program @Arguments
     if ($LASTEXITCODE -ne 0) { throw "Command failed ($LASTEXITCODE): $Program" }
+}
+
+$SigningCertificateThumbprint = ($SigningCertificateThumbprint -replace '[\s-]', '')
+$signingRequested = -not [string]::IsNullOrWhiteSpace($SigningCertificateThumbprint)
+$signTool = $null
+if ($signingRequested) {
+    if ([string]::IsNullOrWhiteSpace($SignToolPath)) {
+        $signTool = (Get-Command signtool.exe -ErrorAction Stop).Source
+    } else {
+        $signTool = (Get-Command $SignToolPath -ErrorAction Stop).Source
+    }
+} elseif ($RequireSignature) {
+    throw 'RequireSignature requires SigningCertificateThumbprint.'
+}
+
+function Sign-Artifact([string]$Path) {
+    if (-not $signingRequested) { return }
+    Invoke-Checked $signTool @('sign', '/sha1', $SigningCertificateThumbprint,
+        '/fd', 'SHA256', '/tr', $TimestampUrl, '/td', 'SHA256', $Path)
+    Invoke-Checked $signTool @('verify', '/pa', '/all', $Path)
 }
 
 $root = $PSScriptRoot
@@ -23,6 +47,9 @@ $csc = Join-Path ([Environment]::GetFolderPath('Windows')) 'Microsoft.NET\Framew
 if (-not (Test-Path -LiteralPath $csc)) { throw '64-bit .NET Framework C# compiler not found.' }
 $zig = (Get-Command $ZigPath -ErrorAction Stop).Source
 New-Item -ItemType Directory -Force -Path $build, $single | Out-Null
+if (-not $signingRequested) {
+    Write-Warning 'No signing certificate supplied; release artifacts will be unsigned and may trigger SmartScreen or behavior-based detections.'
+}
 
 Push-Location $build
 try {
@@ -31,6 +58,7 @@ try {
     $iconTool = Join-Path $build 'generate_icon.exe'
     Invoke-Checked $zig @('cc', '-target', 'x86_64-windows-gnu', '-O2', '-shared',
         (Join-Path $src 'clock_hook.c'), '-o', $module)
+    Sign-Artifact $module
     Invoke-Checked $csc @('/nologo','/codepage:65001','/platform:x64','/reference:System.Drawing.dll',
         ('/out:'+$iconTool),(Join-Path $root 'tools\GenerateIcon.cs'))
     Invoke-Checked $iconTool @($icon)
@@ -41,6 +69,7 @@ try {
         '/reference:System.Drawing.dll', '/reference:System.Web.Extensions.dll',
         ('/win32icon:' + $icon), ('/resource:' + $module + ',ClockNativeV7.dll')) + $appSources
     Invoke-Checked $csc $appArgs
+    Sign-Artifact (Join-Path $single 'TimeZoneClock.exe')
     Write-Host "Single-file build complete: $single"
 
     if ($Test) {
