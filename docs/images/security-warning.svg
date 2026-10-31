@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1100" height="120" viewBox="0 0 1100 120" role="img" aria-labelledby="title desc">
+  <title id="title">报毒风险</title>
+  <desc id="desc">本程序通过向 explorer.exe 注入 DLL 修改 Windows 原生任务栏时钟，可能被杀毒软件识别为木马或注入行为。</desc>
+  <rect x="2" y="2" width="1096" height="116" rx="8" fill="#fff5f5" stroke="#c00000" stroke-width="4"/>
+  <text x="28" y="43" fill="#c00000" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="25" font-weight="700">报毒风险（请在运行前阅读）</text>
+  <text x="28" y="82" fill="#c00000" font-family="Segoe UI, Microsoft YaHei, sans-serif" font-size="19">本程序通过向 explorer.exe 注入 DLL 修改 Windows 原生任务栏时钟，可能被杀毒软件识别为木马或注入行为。</text>
+</svg>
